@@ -6,6 +6,8 @@ from scipy.optimize import linprog
 import matplotlib.pyplot as plt
 
 
+# ---- appliance stuff -------------------------------------------------
+
 @dataclass
 class Appliance:
     name: str
@@ -256,37 +258,102 @@ def print_report(L, sizing, n_days, dod_max):
     print("="*60)
 
 
+# ---- getting stuff from the user -------------------------------------------------
+# figured most of the "hard science" constants (charge/discharge efficiency,
+# DOD, the sunrise/sunset bell curve shape) aren't things a random person
+# sizing their own system would actually know off the top of their head, so
+# those stay as fixed assumptions up in solve_system(). what I AM asking for
+# below is just the stuff someone actually knows without looking anything
+# up - what appliances they've got, roughly what hours they run, how many
+# bad-weather days they want to plan for, and rough prices.
+
+def ask(prompt, default, cast=str):
+    # little wrapper so I'm not rewriting the same try/except every time.
+    # blank input just falls back to the default value
+    raw = input(f"{prompt} [{default}]: ").strip()
+    if raw == "":
+        return default
+    try:
+        return cast(raw)
+    except ValueError:
+        print(f"  (didn't understand that, using the default of {default})")
+        return default
+
+
+def parse_hour_range(text):
+    # "19-4" should mean 7pm through 4am, wrapping past midnight. "12-21"
+    # is just a normal same-day range. keeping the input format dead simple
+    # since asking someone to type out a python set literal is a bit much
+    start_s, end_s = text.split("-")
+    start, end = int(start_s), int(end_s)
+    if end > start:
+        return set(range(start, end))
+    else:
+        return set(range(start, 24)) | set(range(0, end))
+
+
+def get_appliances_from_user():
+    print("\nenter your appliances one at a time. leave the name blank when you're done.\n")
+    appliances = []
+    while True:
+        name = input("appliance name: ").strip()
+        if name == "":
+            break
+        watts = ask("  wattage", 20, float)
+        hrs_text = ask("  hours running (start-end, e.g. 19-4 means 7pm to 4am)", "18-22")
+        try:
+            on_hrs = parse_hour_range(hrs_text)
+        except Exception:
+            print("  (couldn't read that hour range, defaulting to 18-22)")
+            on_hrs = set(range(18, 22))
+        motor = ask("  got a motor that surges on startup, like a fan or pump? (y/n)", "n")
+        surge = 3.0 if motor.lower().startswith("y") else 1.0
+        appliances.append(Appliance(name, watts, on_hrs, surge_mult=surge))
+        print()
+    return appliances
+
+
+DEMO_HOUSEHOLD = [
+    Appliance("DC Fan 1", 30, set(range(12, 22)), surge_mult=3.0),
+    Appliance("DC Fan 2", 30, set(range(12, 22)), surge_mult=3.0),
+    Appliance("LED Bulb 1", 12, set(range(19, 24)) | set(range(0, 5))),
+    Appliance("LED Bulb 2", 12, set(range(19, 24)) | set(range(0, 5))),
+    Appliance("LED Bulb 3", 12, set(range(19, 24)) | set(range(0, 5))),
+    Appliance("Mini Fridge (avg)", 45, set(range(24))),
+]
+
+
 if __name__ == "__main__":
 
-    fan_hrs = set(range(12,22))          # 12pm-9:59pm, hot part of the day
-    bulb_hrs = set(range(19,24)) | set(range(0,5))   # 7pm - 4:59am
+    print("=== micro-grid profiler ===")
+    mode = ask("run the demo household or enter your own appliances? (demo/custom)", "demo")
 
-    household = [
-        Appliance("DC Fan 1", 30, fan_hrs, surge_mult=3.0),
-        Appliance("DC Fan 2", 30, fan_hrs, surge_mult=3.0),
-        Appliance("LED Bulb 1", 12, bulb_hrs),
-        Appliance("LED Bulb 2", 12, bulb_hrs),
-        Appliance("LED Bulb 3", 12, bulb_hrs),
-        # fridge compressor cycles on/off in real life, not modeling that
-        # here, just averaging it down to a rough 50% duty cycle and
-        # treating it as a flat continuous draw. good enough for sizing,
-        # not good enough if someone actually builds this off these numbers
-        Appliance("Mini Fridge (avg)", 45, set(range(24))),
-    ]
+    if mode.lower().startswith("c"):
+        household = get_appliances_from_user()
+        if not household:
+            print("nothing entered, falling back to the demo household instead")
+            household = DEMO_HOUSEHOLD
+    else:
+        household = DEMO_HOUSEHOLD
 
-    N_DAYS = 2
-    WEATHER = [1.0, 0.3]   # clear, then a genuinely bad cloudy day
+    print()
+    n_days = ask("days of autonomy (how many bad days in a row should the battery survive)", 2, int)
+    worst_weather = ask("worst-day sun fraction, 0-1 (0.3 = a genuinely bad cloudy day)", 0.3, float)
+    # day 1 assumed clear sky, everything after that uses the worst-case
+    # weather number - could let someone set a different factor per day but
+    # that's a lot of typing for not much extra insight
+    weather = [1.0] + [worst_weather] * (n_days - 1) if n_days > 1 else [1.0]
 
-    L = build_hourly_load(household, N_DAYS)
-    I = build_irradiance(N_DAYS, WEATHER)
+    panel_cost = ask("panel cost, PKR per watt", 140, float)
+    battery_cost = ask("battery cost, PKR per Wh", 55, float)
+    inverter_cost = ask("inverter cost, PKR per watt", 35, float)
 
-    # rough PKR costs, still need real vendor quotes before trusting these
-    PANEL_PKR_PER_W = 140
-    BATTERY_PKR_PER_WH = 55
-    INVERTER_PKR_PER_W = 35
+    L = build_hourly_load(household, n_days)
+    I = build_irradiance(n_days, weather)
 
-    sizing = solve_system(L, I, PANEL_PKR_PER_W, BATTERY_PKR_PER_WH,
-                           INVERTER_PKR_PER_W, appliances=household)
+    sizing = solve_system(L, I, panel_cost, battery_cost, inverter_cost,
+                           appliances=household)
 
-    print_report(L, sizing, N_DAYS, dod_max=0.8)
-    plot_soc(sizing["soc"], sizing["battery_wh"], 0.8, N_DAYS)
+    print()
+    print_report(L, sizing, n_days, dod_max=0.8)
+    plot_soc(sizing["soc"], sizing["battery_wh"], 0.8, n_days)
